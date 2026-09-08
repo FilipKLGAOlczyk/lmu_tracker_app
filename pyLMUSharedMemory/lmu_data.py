@@ -10,6 +10,7 @@ import ctypes
 import mmap
 
 
+
 class LMUConstants:
     """LMU constants"""
 

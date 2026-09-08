@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 import time
 import os
+import subprocess
 
 
 
 from dotenv import load_dotenv
-from sharedMem_API.pyLMUSharedMemory import lmu_data as api
+from pyLMUSharedMemory import lmu_data as api
 from supabase import create_client
 
 
@@ -47,26 +48,32 @@ def save_player_data_to_cloud(driver, track, car_class, car, best_average_five):
             "avg_five": formatted_time
         }).execute()
         
-        if response.status_code in [200, 201]:
-            print(f"Zapisano dane do Supabase: {response.data}")
-        else:
-            print(f"Błąd podczas zapisywania danych do Supabase: {response.status_code}, {response.data}")
-    except Exception as e:
-        print(f"Wystąpił błąd podczas zapisywania danych do Supabase: {e}")
 
-    finally:
-        pass
+        print(f"Pomyślnie zapisano nowy rekord w Supabase! Czas: {formatted_time}")
+        
+    except Exception as e:
+        print(f"Wystąpił błąd komunikacji z Supabase: {e}")
 
 def track_game_data():
     global current_lap_number, is_current_lap_valid, best_average_five
     
     print("Oczekiwanie na uruchomienie Le Mans Ultimate...")
     
+
+    while True:
+     
+        procesy = subprocess.check_output('tasklist', shell=True).decode('windows-1252', errors='ignore')
+        
+        if "Le Mans Ultimate.exe" in procesy or "LeMansUltimate.exe" in procesy:
+            break # Gra wykryta, przerywamy czekanie!
+            
+        time.sleep(2) # Czekamy 2 sekundy przed kolejnym sprawdzeniem
+
     try:
-        sim_info = api.SimInfo() # Poprawione wywołanie klasy z pliku lmu_data.py
+        sim_info = api.SimInfo() 
         print("Połączono z telemetrią LMU!")
-    except FileNotFoundError:
-        print("Nie wykryto włączonej gry. Uruchom skrypt, gdy gra będzie działać.")
+    except Exception as e:
+        print(f"Błąd łączenia z telemetrią: {e}")
         return
 
     while True:
