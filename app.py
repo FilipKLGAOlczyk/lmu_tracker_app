@@ -5,7 +5,7 @@ import os
 
 
 from dotenv import load_dotenv
-from tracker_api.pyLMUSharedMemory import lmu_data as api
+from sharedMem_API.pyLMUSharedMemory import lmu_data as api
 from supabase import create_client
 
 
