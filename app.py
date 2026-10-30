@@ -4,6 +4,7 @@ import time
 
 import psutil
 from dotenv import load_dotenv
+
 from supabase import create_client
 
 from pyLMUSharedMemory import lmu_data as api
