@@ -1,135 +1,206 @@
 # -*- coding: utf-8 -*-
-import time
 import os
+import time
 
-
-
+import psutil
 from dotenv import load_dotenv
-from tracker_api.pyLMUSharedMemory import lmu_data as api
 from supabase import create_client
 
+from pyLMUSharedMemory import lmu_data as api
 
 load_dotenv()
 
-supabase_url = os.getenv("supabase_url")
-supabase_key = os.getenv("supabase_key")
+SUPABASE_URL = os.getenv("supabase_url")
+SUPABASE_KEY = os.getenv("supabase_key")
 
-if not supabase_url or not supabase_key:
+if not SUPABASE_URL or not SUPABASE_KEY:
     raise ValueError("Supabase URL or key is not set in the environment variables.")
 
-supabase = create_client(supabase_url, supabase_key)
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+GAME_PROCESSES = {"le mans ultimate.exe", "lemansultimate.exe"}
+LAPS_IN_SERIES = 5       # ile czystych okrążeń z rzędu tworzy serię
+POLL_INTERVAL = 0.05     # co ile sekund odczytujemy telemetrię
+
+# Najlepsza średnia wysłana w tym uruchomieniu, osobno dla każdej kombinacji
+# (kierowca, tor, klasa, auto). Ostateczną decyzję o rekordzie podejmuje baza.
+local_best = {}
 
 
+class SessionState:
+    """Stan śledzenia bieżącej sesji."""
 
-last_lap_times = []
-best_average_five = None
+    def __init__(self):
+        self.combo = None         # (kierowca, tor, klasa, auto)
+        self.lap_number = None    # ile okrążeń ukończono przy ostatnim sprawdzeniu
+        self.lap_valid = True     # czy bieżące okrążenie jest dotąd czyste
+        self.laps = []            # czasy ostatnich czystych okrążeń z rzędu
 
-current_lap_number = 0
-is_current_lap_valid = True
+    def restart(self, combo, lap_number):
+        self.combo = combo
+        self.lap_number = lap_number
+        self.lap_valid = True
+        self.laps.clear()
 
-def format_time_to_string(seconds):
-    minutes = int(seconds // 60)
-    # Zamieniamy na int, aby pozbyć się ułamków przed formatowaniem
-    seconds_int = int(seconds % 60) 
-    milliseconds = int(round((seconds % 1) * 1000))
-    # Teraz zadziała poprawny format: "Minuty:Sekundy:Milisekundy"
-    return f"{minutes}:{seconds_int:02d}:{milliseconds:03d}"
 
-def save_player_data_to_cloud(driver, track, car_class, car, best_average_five):
-    formatted_time = format_time_to_string(best_average_five)
-    
+def game_running():
+    return any(
+        (p.info["name"] or "").lower() in GAME_PROCESSES
+        for p in psutil.process_iter(["name"])
+    )
+
+
+def decode(raw):
+    return raw.decode("windows-1252", errors="ignore").split("\x00")[0].strip()
+
+
+def format_time(seconds):
+    """Sekundy -> 'm:ss:mmm' (liczone na milisekundach, bez błędów zaokrąglania)."""
+    total_ms = int(round(seconds * 1000))
+    minutes, rest = divmod(total_ms, 60_000)
+    secs, ms = divmod(rest, 1000)
+    return f"{minutes}:{secs:02d}:{ms:03d}"
+
+
+def submit_time(combo, average_seconds):
+    """Wysyła średnią do bazy. Zwraca True/False (czy to nowy rekord w bazie)
+    albo None, gdy wystąpił błąd komunikacji."""
+    driver, track, car_class, car = combo
     try:
-        response = supabase.table("leaderboard").upsert({
-            "name": driver,
-            "track": track,
-            "class": car_class,
-            "car": car,
-            "avg_five": formatted_time
+        response = supabase.rpc("submit_time", {
+            "p_name": driver,
+            "p_track": track,
+            "p_class": car_class,
+            "p_car": car,
+            "p_avg_s": round(average_seconds, 3),
+            "p_avg_text": format_time(average_seconds),
         }).execute()
-        
-        if response.status_code in [200, 201]:
-            print(f"Zapisano dane do Supabase: {response.data}")
-        else:
-            print(f"Błąd podczas zapisywania danych do Supabase: {response.status_code}, {response.data}")
+        return bool(response.data)
     except Exception as e:
-        print(f"Wystąpił błąd podczas zapisywania danych do Supabase: {e}")
+        print(f"Wystąpił błąd komunikacji z Supabase: {e}")
+        return None
 
-    finally:
-        pass
 
-def track_game_data():
-    global current_lap_number, is_current_lap_valid, best_average_five
-    
-    print("Oczekiwanie na uruchomienie Le Mans Ultimate...")
-    
-    try:
-        sim_info = api.SimInfo() # Poprawione wywołanie klasy z pliku lmu_data.py
-        print("Połączono z telemetrią LMU!")
-    except FileNotFoundError:
-        print("Nie wykryto włączonej gry. Uruchom skrypt, gdy gra będzie działać.")
+def process_clean_lap(state, lap_time):
+    state.laps.append(lap_time)
+    if len(state.laps) > LAPS_IN_SERIES:
+        state.laps.pop(0)
+
+    if len(state.laps) < LAPS_IN_SERIES:
+        print(f"Czyste okrążenia w serii: {len(state.laps)}/{LAPS_IN_SERIES}")
         return
 
-    while True:
+    average = sum(state.laps) / LAPS_IN_SERIES
+    print(f"Średnia z {LAPS_IN_SERIES} ostatnich kółek: {average:.3f} s")
+
+    if average >= local_best.get(state.combo, float("inf")):
+        return
+
+    result = submit_time(state.combo, average)
+    if result is None:
+        return  # błąd sieci: spróbujemy ponownie po następnym okrążeniu
+    local_best[state.combo] = average
+    if result:
+        print(f"NOWY REKORD ŚREDNIEJ w bazie: {format_time(average)}")
+    else:
+        print("W bazie jest już lepszy wynik dla tej kombinacji.")
+
+
+def read_combo(scoring, player_scoring):
+    return (
+        decode(player_scoring.mDriverName),
+        decode(scoring.scoringInfo.mTrackName),
+        decode(player_scoring.mVehicleClass),
+        decode(player_scoring.mVehicleName),
+    )
+
+
+def tick(sim_info, state):
+    telemetry = sim_info.LMUData.telemetry
+    scoring = sim_info.LMUData.scoring
+
+    if not telemetry.playerHasVehicle:
+        return
+
+    idx = telemetry.playerVehicleIdx
+    player_telem = telemetry.telemInfo[idx]
+    player_scoring = scoring.vehScoringInfo[idx]
+
+    combo = read_combo(scoring, player_scoring)
+    laps_completed = player_scoring.mTotalLaps
+
+    # Pierwsze odczyty, zmiana toru/klasy/auta albo nowa sesja (licznik okrążeń
+    # spadł) -> zaczynamy serię od zera, żeby nie mieszać różnych aut i torów.
+    if state.combo != combo or state.lap_number is None or laps_completed < state.lap_number:
+        state.restart(combo, laps_completed)
+        return
+
+    if player_telem.mLapInvalidated or player_scoring.mInPits:
+        state.lap_valid = False
+
+    if laps_completed > state.lap_number:
+        last_lap_time = player_scoring.mLastLapTime
+        if state.lap_number > 0 and last_lap_time > 0:
+            if state.lap_valid:
+                print(f"Czyste okrążenie: {last_lap_time:.3f} s")
+                process_clean_lap(state, last_lap_time)
+            else:
+                print(f"Okrążenie nieważne: {last_lap_time:.3f} s. Reset serii.")
+                state.laps.clear()
+        state.lap_number = laps_completed
+        state.lap_valid = True
+
+
+def connect_to_telemetry():
+    """Łączy z pamięcią współdzieloną; gra może jeszcze się ładować, więc ponawia."""
+    while game_running():
         try:
-            telemetry = sim_info.LMUData.telemetry
-            scoring = sim_info.LMUData.scoring
-            
-            player_idx = telemetry.playerVehicleIdx
-            
-            if not telemetry.playerHasVehicle:
+            sim_info = api.SimInfo()
+            print("Połączono z telemetrią LMU!")
+            return sim_info
+        except Exception as e:
+            print(f"Czekam na telemetrię ({e})...")
+            time.sleep(3)
+    return None
+
+
+def track_game_data():
+    print("Oczekiwanie na uruchomienie Le Mans Ultimate...")
+    while True:
+        while not game_running():
+            time.sleep(2)
+
+        sim_info = connect_to_telemetry()
+        if sim_info is None:
+            continue
+
+        state = SessionState()
+        last_game_check = time.monotonic()
+        last_error = None
+
+        while True:
+            if time.monotonic() - last_game_check > 5:
+                last_game_check = time.monotonic()
+                if not game_running():
+                    print("Gra została zamknięta. Oczekiwanie na ponowne uruchomienie...")
+                    break
+
+            try:
+                tick(sim_info, state)
+                last_error = None
+            except Exception as e:
+                message = f"{type(e).__name__}: {e}"
+                if message != last_error:  # ten sam błąd wypisujemy tylko raz
+                    print(f"Błąd odczytu telemetrii: {message}")
+                    last_error = message
                 time.sleep(1)
                 continue
 
-            player_telem = telemetry.telemInfo[player_idx]
-            player_scoring = scoring.vehScoringInfo[player_idx]
+            time.sleep(POLL_INTERVAL)
 
-            if player_telem.mLapInvalidated or player_scoring.mInPits:
-                is_current_lap_valid = False
-
-            laps_completed = player_scoring.mTotalLaps
-            
-            if laps_completed > current_lap_number:
-                last_lap_time = player_scoring.mLastLapTime
-                
-                if current_lap_number > 0 and last_lap_time > 0:
-                    if is_current_lap_valid:
-                        print(f"Czyste okrążenie: {last_lap_time:.3f} s")
-                        driver_name = player_scoring.mDriverName.decode('windows-1252', errors='ignore').split('\x00')[0]
-                        car_name = player_scoring.mVehicleName.decode('windows-1252', errors='ignore').split('\x00')[0]
-                        class_name = player_scoring.mVehicleClass.decode('windows-1252', errors='ignore').split('\x00')[0]
-                        track_name = scoring.scoringInfo.mTrackName.decode('windows-1252', errors='ignore').split('\x00')[0]
-                        
-                        # 3. Uporządkowana kolejność wysyłania argumentów
-                        process_new_lap(last_lap_time, driver_name, track_name, class_name, car_name)
-                    else:
-                        print(f"Okrążenie nieważne: {last_lap_time:.3f} s. Reset serii.")
-                        last_lap_times.clear()
-                
-                current_lap_number = laps_completed
-                is_current_lap_valid = True
-                
-        except Exception:
-            pass
-            
-        time.sleep(0.05)
-
-# Odbiera parametry w tej samej kolejności, w której zostały wysłane
-def process_new_lap(lap_time, driver_name, track_name, class_name, car_name):
-    global best_average_five
-    
-    last_lap_times.append(lap_time)
-    
-    if len(last_lap_times) > 5:
-        last_lap_times.pop(0)
-
-    if len(last_lap_times) == 5:
-        average_five = sum(last_lap_times) / 5.0
-        print(f"Średnia z 5 ostatnich kółek: {average_five:.3f} s")
-        
-        if best_average_five is None or average_five < best_average_five:
-            best_average_five = average_five
-            print(f"NOWY REKORD ŚREDNIEJ: {best_average_five:.3f} s!")
-            save_player_data_to_cloud(driver_name, track_name, class_name, car_name, best_average_five)
 
 if __name__ == "__main__":
-    track_game_data()
+    try:
+        track_game_data()
+    except KeyboardInterrupt:
+        print("Zakończono.")
